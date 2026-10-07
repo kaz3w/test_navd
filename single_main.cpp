@@ -14,6 +14,9 @@
 #include <time.h>
 #include <pthread.h>
 #include <spnav.h>
+#include "main.h"
+
+#undef	SEND_EV0
 
 
 #if defined(BUILD_AF_UNIX)
@@ -21,55 +24,87 @@ void print_dev_info(void);
 #endif
 
 void sig(int s);
-int send_ev(spnav_event& sev);
+bool send_ev(int s, spnav_event& sev);
+bool send_ev0(spnav_event &sev);
 void hex_dump(const unsigned char* p, int  size, bool with_address);
 void dec_dump(int counter, const int* p, int  size, bool with_address);
 bool bSendCan = true;
+
+
+int init_can()
+{
+	char chbuf[128] = {0};
+	sprintf(chbuf,"sudo ip link set can0 type can bitrate %lu restart-ms 100", CAN_BITRATE );
+	system(chbuf);
+
+	sprintf(chbuf,"sudo ifconfig can0 txqueuelen %lu", CAN_TXQUEUELEN );
+	system(chbuf);
+
+	system("sudo ip link set can0 up");
+
+#ifdef SEND_EV0
+	return 0;
+#else
+	struct sockaddr_can addr;
+	struct ifreq ifr;
+
+	int s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+	if (s < 0)
+	{
+		perror("socket PF_CAN failed");
+		// return 1;
+		exit(EXIT_FAILURE);
+	}
+
+	//2.Specify can0 device
+	strcpy(ifr.ifr_name, "can0");
+	int ret = ioctl(s, SIOCGIFINDEX, &ifr);
+	if (ret < 0) {
+			perror("ioctl failed");
+		exit(EXIT_FAILURE);
+	}
+
+	//3.Bind the socket to can0
+	addr.can_family = AF_CAN;
+	addr.can_ifindex = ifr.ifr_ifindex;
+	ret = bind(s, (struct sockaddr *)&addr, sizeof(addr));
+	if (ret < 0) {
+		perror("bind failed");
+		exit(EXIT_FAILURE);
+	}
+
+	//4.Disable filtering rules, do not receive packets, only send
+	setsockopt(s, SOL_CAN_RAW, CAN_RAW_FILTER, NULL, 0);
+	return s;
+#endif
+}
+
+void fin_can()
+{
+	system("sudo ifconfig can0 down");
+}
+
 
 
 int main(int argc, char** argv)
 {
 	int ev_count = 0;
 
-#if defined(BUILD_X11)
-	Display *dpy;
-	Window win;
-	unsigned long bpix;
-#endif
-
 	spnav_event sev;
-
 	signal(SIGINT, sig);
-
-#if defined(BUILD_X11)
-
-	if(!(dpy = XOpenDisplay(0))) {
-		fprintf(stderr, "failed to connect to the X server\n");
-		return 1;
-	}
-	bpix = BlackPixel(dpy, DefaultScreen(dpy));
-	win = XCreateSimpleWindow(dpy, DefaultRootWindow(dpy), 0, 0, 1, 1, 0, bpix, bpix);
-
-	/* This actually registers our window with the driver for receiving
-	 * motion/button events through the 3dxsrv-compatible X11 protocol.
-	 */
-	if(spnav_x11_open(dpy, win) == -1) {
-		fprintf(stderr, "failed to connect to spacenavd\n");
-		return 1;
-	}
-
-#elif defined(BUILD_AF_UNIX)
+	signal(SIGTERM, sig);
+	signal(SIGHUP, sig);
+	
 	if(spnav_open()==-1) {
 		fprintf(stderr, "failed to connect to spacenavd\n");
 		return 1;
 	}
-
 	spnav_evmask(SPNAV_EVMASK_MOTION|SPNAV_EVMASK_BUTTON);
+	// print_dev_info();
 
-	print_dev_info();
-#else
-#error Unknown build type!
-#endif
+
+fin_can();
+int s = init_can();
 
 	/* spnav_wait_event() and spnav_poll_event(), will silently ignore any non-spnav X11 events.
 	 *
@@ -80,7 +115,15 @@ int main(int argc, char** argv)
 	while(spnav_wait_event(&sev)) {
 		if(sev.type == SPNAV_EVENT_MOTION) {
 			if (bSendCan) {
-				send_ev(sev);
+#ifdef SEND_EV0
+				send_ev0(sev);
+#else
+				if (!send_ev(s,sev)) {
+					close(s);
+					fin_can();
+					s = init_can();
+				}
+#endif
 			}
 			else {
 				printf("[%u] got motion event: t(%d, %d, %d) ", ev_count, sev.motion.x, sev.motion.y, sev.motion.z);
@@ -88,36 +131,114 @@ int main(int argc, char** argv)
 			}
 		} else if(sev.type == SPNAV_EVENT_BUTTON ) {
 			if (bSendCan) {
-				send_ev(sev);
-			}
-			else {
-				printf("[%u] got button %s event b(%d)\n",ev_count,  sev.button.press ? "press" : "release", sev.button.bnum);
-			}
+#ifdef SEND_EV0
+				send_ev0(sev);
+#else
+				if (!send_ev(s,sev)) {
+					close(s);
+					fin_can();
+					s = init_can();
+				}
+			// else {
+			// 	printf("[%u] got button %s event b(%d)\n",ev_count,  sev.button.press ? "press" : "release", sev.button.bnum);
+			// }
+#endif
 		}
-		else {
-			// TODO: ???
 		}
 		ev_count++;
 	}
 	spnav_close();
+
+	close(s);
+	fin_can();
+
 	return EXIT_SUCCESS;
 }
 
 
 
 
-int send_ev(spnav_event& sev)
+bool send_ev(int s, spnav_event& sev)
 {
 	static int j = 0;
-    int ret;
-    int s, nbytes;
-    struct sockaddr_can addr;
-    struct ifreq ifr;
+    bool ret;
+    int nbytes = 0;
 
-    s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (s < 0) {
-        perror("socket PF_CAN failed");
-        return 1;
+    struct can_frame frame;
+    memset(&frame, 0, sizeof(struct can_frame));
+
+	if(sev.type == SPNAV_EVENT_MOTION) {
+		frame.can_id = 0x111;
+		frame.can_dlc = 8;
+		frame.data[0] = sev.motion.x & 0xff;
+		frame.data[1] = sev.motion.y & 0xff;
+		frame.data[2] = sev.motion.z & 0xff;
+		frame.data[3] = sev.motion.rx & 0xff;
+		frame.data[4] = sev.motion.ry & 0xff;
+		frame.data[5] = (j >> 16) & 0xff;
+		frame.data[6] = (j >> 8) & 0xff;
+		frame.data[7] = j & 0xff;
+	} else if(sev.type == SPNAV_EVENT_BUTTON ) {
+		frame.can_id = 0x222 + 0x111 * sev.button.bnum;
+		frame.can_dlc = 1;
+		frame.data[0] = sev.button.bnum;
+		frame.data[1] = sev.button.press ? 1 : 0;
+		frame.data[2] = 0;
+		frame.data[3] = 0;
+		frame.data[4] = (j >> 24) & 0xff;
+		frame.data[5] = (j >> 16) & 0xff;
+		frame.data[6] = (j >> 8) & 0xff;
+		frame.data[7] = j & 0xff;
+	}
+
+	int nTmp[8] = {0};
+	int indexTmp = 0;
+	nTmp[indexTmp++] = frame.can_id;
+	nTmp[indexTmp++] = sev.motion.x;
+	nTmp[indexTmp++] = sev.motion.y;
+	nTmp[indexTmp++] = sev.motion.z;
+	nTmp[indexTmp++] = sev.motion.rx;
+	nTmp[indexTmp++] = sev.motion.ry;
+	nTmp[indexTmp++] = sev.motion.rz;
+
+	dec_dump( j, nTmp, sizeof(nTmp)/sizeof(nTmp[0]), true );
+
+	//6.Send message
+	printf("write:\n");
+	nbytes = write(s, &frame, sizeof(frame)); 
+
+	if(nbytes != sizeof(frame)) {
+		printf("NG [%d] [%d] nbytes!! [%d]\n", sev.type, j, nbytes);
+		usleep(100000);
+		ret = false;
+	}
+	else {
+		printf("OK [%d] [%d] nbytes [%d]\n", sev.type, j, nbytes);
+		// printf("[%d] OK [%d]\n", j, nbytes);
+		ret = true;
+		usleep(1000);
+	}
+	j++;
+	return ret;
+}
+
+
+bool send_ev0(spnav_event& sev)
+{
+	fin_can();
+	init_can();
+
+	int ret;
+	int s, nbytes;
+	struct sockaddr_can addr;
+	struct ifreq ifr;
+
+	// 1.Create can0 RAW socket
+	s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+	if (s < 0)
+	{
+		perror("socket PF_CAN failed");
+		return 1;
     }
     
     //2.Specify can0 device
@@ -142,80 +263,62 @@ int send_ev(spnav_event& sev)
     struct can_frame frame;
     memset(&frame, 0, sizeof(struct can_frame));
 
-	if(sev.type == SPNAV_EVENT_MOTION) {
-		// printf("[%u] got motion event: t(%d, %d, %d) ", ev_count, sev.motion.x, sev.motion.y, sev.motion.z);
-		// printf("r(%d, %d, %d)\n", sev.motion.rx, sev.motion.ry, sev.motion.rz);
-		//5.Set send data
-		frame.can_id = 0x111;
-		frame.can_dlc = 8;
-		frame.data[0] = sev.motion.x & 0xff;
-		frame.data[1] = sev.motion.y & 0xff;
-		frame.data[2] = sev.motion.z & 0xff;
-		frame.data[3] = sev.motion.rx & 0xff;
-		frame.data[4] = sev.motion.ry & 0xff;
-		frame.data[5] = (j >> 16) & 0xff;
-		frame.data[6] = (j >> 8) & 0xff;
-		frame.data[7] = j & 0xff;
+		if(sev.type == SPNAV_EVENT_MOTION) {
+			// printf("[%u] got motion event: t(%d, %d, %d) ", ev_count, sev.motion.x, sev.motion.y, sev.motion.z);
+			// printf("r(%d, %d, %d)\n", sev.motion.rx, sev.motion.ry, sev.motion.rz);
+			//5.Set send data
+			frame.can_id = 0x111;
+			frame.can_dlc = 8;
+			frame.data[0] = sev.motion.x & 0xff;
+			frame.data[1] = sev.motion.y & 0xff;
+			frame.data[2] = sev.motion.z & 0xff;
+			frame.data[3] = sev.motion.rx & 0xff;
+			frame.data[4] = sev.motion.ry & 0xff;
+			frame.data[5] = 0;
+			frame.data[6] = 0;
+			frame.data[7] = 0;
 
-	} else if(sev.type == SPNAV_EVENT_BUTTON ) {
-		// printf("[%u] got button %s event b(%d)\n",ev_count,  sev.button.press ? "press" : "release", sev.button.bnum);
-		//5.Set send data
-		frame.can_id = 0x222 + 0x111 * sev.button.bnum;
-		frame.can_dlc = 1;
-		frame.data[0] = sev.button.bnum;
-		frame.data[1] = sev.button.press ? 1 : 0;
-		frame.data[2] = 0;
-		frame.data[3] = 0;
-		frame.data[4] = (j >> 24) & 0xff;
-		frame.data[5] = (j >> 16) & 0xff;
-		frame.data[6] = (j >> 8) & 0xff;
-		frame.data[7] = j & 0xff;
-	}
+		} else if(sev.type == SPNAV_EVENT_BUTTON ) {
+			// printf("[%u] got button %s event b(%d)\n",ev_count,  sev.button.press ? "press" : "release", sev.button.bnum);
+			//5.Set send data
+			frame.can_id = 0x222 + 0x111 * sev.button.bnum;
+			frame.can_dlc = 1;
+			frame.data[0] = sev.button.bnum;
+			frame.data[1] = sev.button.press ? 1 : 0;
+			frame.data[2] = 0;
+			frame.data[3] = 0;
+			frame.data[4] = 0;
+			frame.data[5] = 0;
+			frame.data[6] = 0;
+			frame.data[7] = 0;
+		}
 
-#if 1
-	int nTmp[8] = {0};
-	int indexTmp = 0;
-	nTmp[indexTmp++] = frame.can_id;
-	nTmp[indexTmp++] = sev.motion.x;
-	nTmp[indexTmp++] = sev.motion.y;
-	nTmp[indexTmp++] = sev.motion.z;
-	nTmp[indexTmp++] = sev.motion.rx;
-	nTmp[indexTmp++] = sev.motion.ry;
-	nTmp[indexTmp++] = sev.motion.rz;
-
-	dec_dump( j, nTmp, sizeof(nTmp)/sizeof(nTmp[0]), true );
-#else
-	unsigned char chTmp[16] = {0};
-	chTmp[0] = (frame.can_id >> 24) & 0xff;
-	chTmp[1] = (frame.can_id >> 16) & 0xff;
-	chTmp[2] = (frame.can_id >> 8) & 0xff;
-	chTmp[3] = (frame.can_id >> 0) & 0xff;
-	for (int ii=0; ii<8; ii++) {
-		chTmp[8+ii] = frame.data[ii];		
-	}
-	hex_dump( chTmp, sizeof chTmp, true );
-#endif
+		int nTmp[8] = {0};
+		int indexTmp = 0;
+		nTmp[indexTmp++] = frame.can_id;
+		nTmp[indexTmp++] = sev.motion.x;
+		nTmp[indexTmp++] = sev.motion.y;
+		nTmp[indexTmp++] = sev.motion.z;
+		nTmp[indexTmp++] = sev.motion.rx;
+		nTmp[indexTmp++] = sev.motion.ry;
+		nTmp[indexTmp++] = sev.motion.rz;
+		// dec_dump( j, nTmp, sizeof(nTmp)/sizeof(nTmp[0]), true );
 
     //6.Send message
     nbytes = write(s, &frame, sizeof(frame)); 
-
     if(nbytes != sizeof(frame)) {
-        printf("Send Error frame[0]!\r\n");
-		close (s);
-			system("sudo ifconfig can0 down");
-		sleep(1);
-			system("sudo ip link set can0 type can bitrate 500000");
-			system("sudo ifconfig can0 up");
+      printf("Send Error frame[0]!\r\n");
+			close (s);
+			// fin_can();
+		}
+		else {
+			usleep(1000);
+			//Close the socket and can0
+			close(s);
     }
-    else {
-		usleep(1000);
-
-		//Close the socket and can0
-		close(s);
-    }
-	j++;
-	return 0;
+	return true;
 }
+
 
 
 
@@ -253,20 +356,6 @@ void sig(int s)
 	spnav_close();
 	exit(0);
 }
-
-
-#define DBG_COLOR_BLACK "\033[0;30m"
-#define DBG_COLOR_GRAY "\033[1;30m"
-#define DBG_COLOR_RED "\033[1;31m"
-#define DBG_COLOR_GREEN "\033[0;32m"
-#define DBG_COLOR_YELLOW "\033[0;33m"
-#define DBG_COLOR_BLUE "\033[0;34m"
-#define DBG_COLOR_MAGENDA "\033[0;35m"
-#define DBG_COLOR_CYAN "\033[0;36m"
-#define DBG_COLOR_WHITE "\033[1;37m"
-
-#define DBG_COLOR_DK_WHITE "\033[37m"
-#define DBG_EOF_COLOR   "\033[0;37m"
 
 
 /************************************************************/

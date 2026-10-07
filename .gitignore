@@ -37,3 +37,4 @@ multi_test
 joy_test
 *.code-workspace
 
+test_socket_can
